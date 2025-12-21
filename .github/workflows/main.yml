@@ -16,14 +16,51 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v4
                 
-            # 步骤2: 修改内核版本代码定义
+            # 步骤2: 查找并修改内核版本代码定义
             - name: Modify MY_LINUX_VERSION_CODE
               run: |
-                  # 使用sed在指定行后插入定义
-                  sed -i '/#ifndef MY_LINUX_VERSION_CODE/a\\\n#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
-                  # 验证修改
-                  echo "修改后的文件内容:"
-                  cat kerneldriver/ver_control.h | grep -A2 -B2 "MY_LINUX_VERSION_CODE"
+                  # 首先检查文件是否存在
+                  echo "当前目录结构:"
+                  ls -la
+                  
+                  # 查找 ver_control.h 文件
+                  echo "查找 ver_control.h 文件..."
+                  find . -name "ver_control.h" -type f | head -10
+                  
+                  # 检查 kerneldriver 目录是否存在
+                  if [ -d "kerneldriver" ]; then
+                      echo "kerneldriver 目录存在"
+                      ls -la kerneldriver/
+                      
+                      if [ -f "kerneldriver/ver_control.h" ]; then
+                          echo "找到 kerneldriver/ver_control.h"
+                          # 备份原文件
+                          cp kerneldriver/ver_control.h kerneldriver/ver_control.h.bak
+                          # 使用sed在指定行后插入定义
+                          sed -i '/#ifndef MY_LINUX_VERSION_CODE/a\\\n#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
+                          # 验证修改
+                          echo "修改后的文件内容:"
+                          cat kerneldriver/ver_control.h | grep -A2 -B2 "MY_LINUX_VERSION_CODE"
+                      else
+                          echo "kerneldriver/ver_control.h 不存在，创建文件..."
+                          mkdir -p kerneldriver
+                          cat > kerneldriver/ver_control.h << 'EOF'
+#ifndef MY_LINUX_VERSION_CODE
+#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)
+#endif
+EOF
+                          cat kerneldriver/ver_control.h
+                      fi
+                  else
+                      echo "kerneldriver 目录不存在，创建并添加 ver_control.h..."
+                      mkdir -p kerneldriver
+                      cat > kerneldriver/ver_control.h << 'EOF'
+#ifndef MY_LINUX_VERSION_CODE
+#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)
+#endif
+EOF
+                      cat kerneldriver/ver_control.h
+                  fi
 
             # 步骤3: 安装repo工具
             - name: Install repo tool
@@ -33,7 +70,7 @@ jobs:
                   curl -s https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
                   chmod a+x /usr/local/bin/repo
                   echo "repo版本:"
-                  repo --version || echo "repo tool installed"
+                  repo --version 2>/dev/null || echo "repo tool installed"
 
             # 步骤4: 设置Android内核源码
             - name: Set up Android Kernel source
@@ -44,17 +81,27 @@ jobs:
                   git config --global user.email "action@github.com"
                   git config --global user.name "GitHub Action"
                   git config --global color.ui false
+                  git config --global advice.detachedHead false
                   repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
                   repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc) || repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
 
             # 步骤5: 复制内核驱动文件
             - name: Copy kerneldriver
               run: |
-                  cd android-kernel
-                  mkdir -p common/drivers/kerneldriver
-                  cp -r ../kerneldriver/* common/drivers/kerneldriver/
-                  echo "已复制文件:"
-                  ls -la common/drivers/kerneldriver/
+                  echo "当前目录结构:"
+                  ls -la
+                  
+                  if [ -d "kerneldriver" ]; then
+                      echo "复制 kerneldriver 到 android-kernel..."
+                      cd android-kernel
+                      mkdir -p common/drivers/kerneldriver
+                      cp -r ../kerneldriver/* common/drivers/kerneldriver/
+                      echo "已复制文件:"
+                      ls -la common/drivers/kerneldriver/
+                  else
+                      echo "错误: kerneldriver 目录不存在！"
+                      exit 1
+                  fi
 
             # 步骤6: 修改Makefile添加驱动编译配置
             - name: Modify Makefile
@@ -106,24 +153,30 @@ jobs:
                   mkdir -p out
                   
                   echo "开始构建Android内核..."
+                  echo "构建配置: BUILD_CONFIG=$BUILD_CONFIG, LTO=$LTO"
+                  
                   # 运行构建脚本
                   if [ -f "build/build.sh" ]; then
+                      echo "找到 build/build.sh，开始构建..."
                       build/build.sh -j$(nproc)
                   else
                       echo "错误: build/build.sh 不存在"
-                      ls -la build/
+                      echo "当前目录: $(pwd)"
+                      echo "build目录内容:"
+                      ls -la build/ 2>/dev/null || echo "build目录不存在"
                       exit 1
                   fi
 
             # 步骤9: 上传编译好的驱动文件
             - name: Upload kerneldriver.ko
-              if: success() || failure()  # 无论构建成功与否都尝试上传
-              uses: actions/upload-artifact@v4  # 使用v4版本
+              if: success() || failure()
+              uses: actions/upload-artifact@v4
               with:
                   name: kernel-driver-artifacts
                   path: |
                       android-kernel/out/**/*.ko
                       android-kernel/out/android12-5.10/dist/
+                      android-kernel/out/android12-5.10/common/drivers/kerneldriver/
                   retention-days: 7
 
             # 步骤10: 检查构建输出
@@ -131,6 +184,11 @@ jobs:
               if: always()
               run: |
                   echo "构建输出目录内容:"
-                  find android-kernel/out -name "*.ko" -type f 2>/dev/null | head -20 || echo "未找到.ko文件"
-                  echo "目录结构:"
+                  find android-kernel/out -type f -name "*.ko" 2>/dev/null | head -30 || echo "未找到.ko文件"
+                  echo "=== 重要文件检查 ==="
+                  echo "1. kerneldriver目录:"
+                  ls -la android-kernel/out/android12-5.10/common/drivers/kerneldriver/ 2>/dev/null || echo "kerneldriver目录不存在"
+                  echo "2. dist目录:"
+                  ls -la android-kernel/out/android12-5.10/dist/ 2>/dev/null || echo "dist目录不存在"
+                  echo "3. out根目录:"
                   ls -la android-kernel/out/ 2>/dev/null || echo "out目录不存在"
