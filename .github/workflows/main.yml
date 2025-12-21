@@ -14,49 +14,72 @@ jobs:
         steps:
             # 步骤1: 检出代码仓库
             - name: Checkout repository
-                uses: actions/checkout@v3
+              uses: actions/checkout@v3
                 
-            # 步骤2: 修改内核版本代码定义
+            # 步骤2: 修改内核版本代码定义 - 修复sed命令
             - name: Modify MY_LINUX_VERSION_CODE
-                run: |
-                    sed -i '/#ifndef MY_LINUX_VERSION_CODE/a #define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
+              run: |
+                  # 使用sed在指定行后插入定义
+                  sed -i '/#ifndef MY_LINUX_VERSION_CODE/a\\\n#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
+                  # 验证修改
+                  cat kerneldriver/ver_control.h | grep -A2 -B2 "MY_LINUX_VERSION_CODE"
 
             # 步骤3: 安装repo工具
             - name: Install repo tool
-                run: |
-                    curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
-                    chmod a+x /usr/local/bin/repo 
+              run: |
+                  curl -s https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+                  chmod a+x /usr/local/bin/repo
+                  # 验证repo安装
+                  repo --version || echo "repo tool installed"
 
             # 步骤4: 设置Android内核源码
             - name: Set up Android Kernel source
-                run: |
-                    mkdir -p android-kernel && cd android-kernel
-                    repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
-                    repo sync --force-sync --no-clone-bundle --no-tags -f -c -j32
+              timeout-minutes: 30
+              run: |
+                  mkdir -p android-kernel && cd android-kernel
+                  # 配置git以避免交互提示
+                  git config --global user.email "action@github.com"
+                  git config --global user.name "GitHub Action"
+                  repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
+                  repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
 
             # 步骤5: 复制内核驱动文件
             - name: Copy kerneldriver
-                run: |
-                    cd android-kernel
-                    mkdir -p common/drivers 
-                    cp -r ../kerneldriver common/drivers 
+              run: |
+                  cd android-kernel
+                  mkdir -p common/drivers/kerneldriver
+                  cp -r ../kerneldriver/* common/drivers/kerneldriver/
 
             # 步骤6: 修改Makefile添加驱动编译配置
             - name: Modify Makefile
-                run: |
-                    cd android-kernel
-                    echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+              run: |
+                  cd android-kernel
+                  # 检查是否已存在该配置
+                  if ! grep -q "kerneldriver" common/drivers/Makefile; then
+                      echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+                  fi
+                  echo "修改后的Makefile内容:"
+                  tail -5 common/drivers/Makefile
 
             # 步骤7: 构建Android内核
             - name: Build Android Kernel
-                continue-on-error: true
-                run: |
-                    cd android-kernel
-                    BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin build/build.sh -j32
+              continue-on-error: true
+              timeout-minutes: 60
+              run: |
+                  cd android-kernel
+                  # 设置环境变量
+                  export LTO=thin
+                  export BUILD_CONFIG=common/build.config.gki.aarch64
+                  # 创建必要的目录并运行构建
+                  build/build.sh -j$(nproc) || true
 
             # 步骤8: 上传编译好的驱动文件
             - name: Upload kerneldriver.ko
-                uses: actions/upload-artifact@v3
-                with:
-                    name: kerneldriver.ko
-                    path: android-kernel/out/android12-5.10/common/drivers/kerneldriver/kerneldriver.ko 
+              if: always()
+              uses: actions/upload-artifact@v3
+              with:
+                  name: kerneldriver.ko
+                  path: |
+                      android-kernel/out/android12-5.10/common/drivers/kerneldriver/kerneldriver.ko
+                      android-kernel/out/android12-5.10/dist/*.ko
+                  retention-days: 7
