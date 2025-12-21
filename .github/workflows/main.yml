@@ -1,5 +1,5 @@
 name: Android Kernel Module Builder (Minimal)
-#泪心提交
+
 # 极简版：只下载预编译的内核头文件，编译单个模块
 # 适合 GitHub 免费用户，编译时间约 10-30 分钟
 
@@ -53,7 +53,6 @@ jobs:
 
       - name: Setup Android NDK (for cross-compilation)
         run: |
-          # 下载 Android NDK
           wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip
           unzip -q android-ndk-r26c-linux.zip
           export NDK_PATH=$PWD/android-ndk-r26c
@@ -65,8 +64,6 @@ jobs:
           mkdir -p kernel-headers
           cd kernel-headers
           
-          # 从 Google 的 GKI 预编译中获取内核头文件
-          # 这比编译整个内核快得多
           KERNEL_VER="${{ github.event.inputs.kernel_version }}"
           
           case $KERNEL_VER in
@@ -83,7 +80,6 @@ jobs:
           
           echo "Downloading kernel headers for $BRANCH..."
           
-          # 浅克隆只获取头文件
           git clone --depth=1 --single-branch \
             -b common-$BRANCH \
             https://android.googlesource.com/kernel/common \
@@ -93,18 +89,18 @@ jobs:
           ls -la kernel-source/
 
       - name: Prepare driver source
+        env:
+          DRIVER_NAME: ${{ github.event.inputs.driver_name }}
         run: |
           mkdir -p driver-src
           
-          # 复制驱动源码
           if [ -d "./code" ]; then
             cp ./code/*.c ./code/*.h driver-src/ 2>/dev/null || true
           fi
           
-          # 如果没有源码，创建示例
-          if [ ! -f "driver-src/${{ github.event.inputs.driver_name }}.c" ]; then
+          if [ ! -f "driver-src/${DRIVER_NAME}.c" ]; then
             echo "Creating sample driver..."
-            cat > driver-src/${{ github.event.inputs.driver_name }}.c << 'EOF'
+            cat > "driver-src/${DRIVER_NAME}.c" <<'CEOF'
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -126,12 +122,11 @@ static void __exit sample_exit(void)
 
 module_init(sample_init);
 module_exit(sample_exit);
-EOF
+CEOF
           fi
           
-          # 创建 Makefile
-          cat > driver-src/Makefile << EOF
-obj-m += ${{ github.event.inputs.driver_name }}.o
+          cat > driver-src/Makefile <<MEOF
+obj-m += ${DRIVER_NAME}.o
 
 KERNEL_SRC ?= ../kernel-headers/kernel-source
 
@@ -140,7 +135,7 @@ all:
 
 clean:
 	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) clean
-EOF
+MEOF
           
           echo "=== Driver source ==="
           ls -la driver-src/
@@ -149,14 +144,11 @@ EOF
         run: |
           cd kernel-headers/kernel-source
           
-          # 使用 GKI defconfig
           make ARCH=arm64 LLVM=1 gki_defconfig || make ARCH=arm64 LLVM=1 defconfig
           
-          # 启用模块支持
           scripts/config --enable CONFIG_MODULES
           scripts/config --enable CONFIG_MODULE_UNLOAD
           
-          # 准备内核头文件
           make ARCH=arm64 LLVM=1 modules_prepare -j$(nproc)
           
           echo "=== Kernel configured ==="
@@ -182,7 +174,6 @@ EOF
           echo "=== Output files ==="
           ls -la output/
           
-          # 显示模块信息
           for ko in output/*.ko; do
             if [ -f "$ko" ]; then
               echo "=== Module info: $ko ==="
