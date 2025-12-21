@@ -14,34 +14,38 @@ jobs:
         steps:
             # 步骤1: 检出代码仓库
             - name: Checkout repository
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
                 
-            # 步骤2: 修改内核版本代码定义 - 修复sed命令
+            # 步骤2: 修改内核版本代码定义
             - name: Modify MY_LINUX_VERSION_CODE
               run: |
                   # 使用sed在指定行后插入定义
                   sed -i '/#ifndef MY_LINUX_VERSION_CODE/a\\\n#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
                   # 验证修改
+                  echo "修改后的文件内容:"
                   cat kerneldriver/ver_control.h | grep -A2 -B2 "MY_LINUX_VERSION_CODE"
 
             # 步骤3: 安装repo工具
             - name: Install repo tool
               run: |
+                  sudo apt-get update
+                  sudo apt-get install -y curl git python3
                   curl -s https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
                   chmod a+x /usr/local/bin/repo
-                  # 验证repo安装
+                  echo "repo版本:"
                   repo --version || echo "repo tool installed"
 
             # 步骤4: 设置Android内核源码
             - name: Set up Android Kernel source
-              timeout-minutes: 30
+              timeout-minutes: 45
               run: |
                   mkdir -p android-kernel && cd android-kernel
                   # 配置git以避免交互提示
                   git config --global user.email "action@github.com"
                   git config --global user.name "GitHub Action"
+                  git config --global color.ui false
                   repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
-                  repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
+                  repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc) || repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
 
             # 步骤5: 复制内核驱动文件
             - name: Copy kerneldriver
@@ -49,37 +53,84 @@ jobs:
                   cd android-kernel
                   mkdir -p common/drivers/kerneldriver
                   cp -r ../kerneldriver/* common/drivers/kerneldriver/
+                  echo "已复制文件:"
+                  ls -la common/drivers/kerneldriver/
 
             # 步骤6: 修改Makefile添加驱动编译配置
             - name: Modify Makefile
               run: |
                   cd android-kernel
+                  # 确保Makefile存在
+                  if [ ! -f common/drivers/Makefile ]; then
+                      echo "创建Makefile..."
+                      touch common/drivers/Makefile
+                  fi
                   # 检查是否已存在该配置
                   if ! grep -q "kerneldriver" common/drivers/Makefile; then
+                      echo "添加kerneldriver到Makefile..."
                       echo "obj-y += kerneldriver/" >> common/drivers/Makefile
                   fi
-                  echo "修改后的Makefile内容:"
-                  tail -5 common/drivers/Makefile
+                  echo "Makefile最后几行内容:"
+                  tail -10 common/drivers/Makefile
 
-            # 步骤7: 构建Android内核
+            # 步骤7: 安装构建依赖
+            - name: Install build dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                    build-essential \
+                    flex \
+                    bison \
+                    libncurses-dev \
+                    libssl-dev \
+                    libelf-dev \
+                    bc \
+                    rsync \
+                    kmod \
+                    cpio \
+                    python3 \
+                    python3-pip
+
+            # 步骤8: 构建Android内核
             - name: Build Android Kernel
-              continue-on-error: true
-              timeout-minutes: 60
+              timeout-minutes: 120
               run: |
                   cd android-kernel
                   # 设置环境变量
                   export LTO=thin
                   export BUILD_CONFIG=common/build.config.gki.aarch64
-                  # 创建必要的目录并运行构建
-                  build/build.sh -j$(nproc) || true
+                  export KBUILD_BUILD_USER=github-action
+                  export KBUILD_BUILD_HOST=github
+                  
+                  # 创建必要的目录
+                  mkdir -p out
+                  
+                  echo "开始构建Android内核..."
+                  # 运行构建脚本
+                  if [ -f "build/build.sh" ]; then
+                      build/build.sh -j$(nproc)
+                  else
+                      echo "错误: build/build.sh 不存在"
+                      ls -la build/
+                      exit 1
+                  fi
 
-            # 步骤8: 上传编译好的驱动文件
+            # 步骤9: 上传编译好的驱动文件
             - name: Upload kerneldriver.ko
-              if: always()
-              uses: actions/upload-artifact@v3
+              if: success() || failure()  # 无论构建成功与否都尝试上传
+              uses: actions/upload-artifact@v4  # 使用v4版本
               with:
-                  name: kerneldriver.ko
+                  name: kernel-driver-artifacts
                   path: |
-                      android-kernel/out/android12-5.10/common/drivers/kerneldriver/kerneldriver.ko
-                      android-kernel/out/android12-5.10/dist/*.ko
+                      android-kernel/out/**/*.ko
+                      android-kernel/out/android12-5.10/dist/
                   retention-days: 7
+
+            # 步骤10: 检查构建输出
+            - name: Check build output
+              if: always()
+              run: |
+                  echo "构建输出目录内容:"
+                  find android-kernel/out -name "*.ko" -type f 2>/dev/null | head -20 || echo "未找到.ko文件"
+                  echo "目录结构:"
+                  ls -la android-kernel/out/ 2>/dev/null || echo "out目录不存在"
