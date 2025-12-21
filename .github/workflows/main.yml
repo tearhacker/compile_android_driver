@@ -1,194 +1,123 @@
-# 工作流名称为 Android12-5.10
-name: Android12-5.10
+name: Android Kernel Driver Builder
 
-# 触发条件配置
 on:
-    workflow_dispatch:  # 允许手动触发工作流执行
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Android Version (Kernel) (e.g., 14)'
+        required: true
+      kernel_version:
+        description: 'Kernel Version (e.g., 6.1)'
+        required: true
+      driver_name:
+        description: 'Driver Module Name (e.g., mydriver.ko)'
+        required: true
+      target_arch:
+        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        required: true
+        default: 'aarch64'
 
-# 定义工作流中的作业
 jobs:
-    build:
-        # 指定运行环境为最新版Ubuntu
-        runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
         
-        steps:
-            # 步骤1: 检出代码仓库
-            - name: Checkout repository
-              uses: actions/checkout@v4
-                
-            # 步骤2: 查找并修改内核版本代码定义
-            - name: Modify MY_LINUX_VERSION_CODE
-              run: |
-                  # 首先检查文件是否存在
-                  echo "当前目录结构:"
-                  ls -la
-                  
-                  # 查找 ver_control.h 文件
-                  echo "查找 ver_control.h 文件..."
-                  find . -name "ver_control.h" -type f | head -10
-                  
-                  # 检查 kerneldriver 目录是否存在
-                  if [ -d "kerneldriver" ]; then
-                      echo "kerneldriver 目录存在"
-                      ls -la kerneldriver/
-                      
-                      if [ -f "kerneldriver/ver_control.h" ]; then
-                          echo "找到 kerneldriver/ver_control.h"
-                          # 备份原文件
-                          cp kerneldriver/ver_control.h kerneldriver/ver_control.h.bak
-                          # 使用sed在指定行后插入定义
-                          sed -i '/#ifndef MY_LINUX_VERSION_CODE/a\\\n#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)' kerneldriver/ver_control.h
-                          # 验证修改
-                          echo "修改后的文件内容:"
-                          cat kerneldriver/ver_control.h | grep -A2 -B2 "MY_LINUX_VERSION_CODE"
-                      else
-                          echo "kerneldriver/ver_control.h 不存在，创建文件..."
-                          mkdir -p kerneldriver
-                          cat > kerneldriver/ver_control.h << 'EOF'
-#ifndef MY_LINUX_VERSION_CODE
-#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)
-#endif
-EOF
-                          cat kerneldriver/ver_control.h
-                      fi
-                  else
-                      echo "kerneldriver 目录不存在，创建并添加 ver_control.h..."
-                      mkdir -p kerneldriver
-                      cat > kerneldriver/ver_control.h << 'EOF'
-#ifndef MY_LINUX_VERSION_CODE
-#define MY_LINUX_VERSION_CODE KERNEL_VERSION(5,10,43)
-#endif
-EOF
-                      cat kerneldriver/ver_control.h
-                  fi
+      - name: Prepare kerneldriver directory
+        run: |
+          mkdir kerneldriver
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          
+      - name: Install repo tool
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
 
-            # 步骤3: 安装repo工具
-            - name: Install repo tool
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y curl git python3
-                  curl -s https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
-                  chmod a+x /usr/local/bin/repo
-                  echo "repo版本:"
-                  repo --version 2>/dev/null || echo "repo tool installed"
+      - name: Set up Android Kernel source
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-            # 步骤4: 设置Android内核源码
-            - name: Set up Android Kernel source
-              timeout-minutes: 45
-              run: |
-                  mkdir -p android-kernel && cd android-kernel
-                  # 配置git以避免交互提示
-                  git config --global user.email "action@github.com"
-                  git config --global user.name "GitHub Action"
-                  git config --global color.ui false
-                  git config --global advice.detachedHead false
-                  repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --no-repo-verify --depth=1
-                  repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc) || repo sync --force-sync --no-clone-bundle --no-tags -f -c -j$(nproc)
+      - name: Copy kerneldriver
+        run: |
+          cd android-kernel
+          cp -r ../kerneldriver common/drivers
 
-            # 步骤5: 复制内核驱动文件
-            - name: Copy kerneldriver
-              run: |
-                  echo "当前目录结构:"
-                  ls -la
-                  
-                  if [ -d "kerneldriver" ]; then
-                      echo "复制 kerneldriver 到 android-kernel..."
-                      cd android-kernel
-                      mkdir -p common/drivers/kerneldriver
-                      cp -r ../kerneldriver/* common/drivers/kerneldriver/
-                      echo "已复制文件:"
-                      ls -la common/drivers/kerneldriver/
-                  else
-                      echo "错误: kerneldriver 目录不存在！"
-                      exit 1
-                  fi
+      - name: Modify Makefile
+        run: |
+          cd android-kernel
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
 
-            # 步骤6: 修改Makefile添加驱动编译配置
-            - name: Modify Makefile
-              run: |
-                  cd android-kernel
-                  # 确保Makefile存在
-                  if [ ! -f common/drivers/Makefile ]; then
-                      echo "创建Makefile..."
-                      touch common/drivers/Makefile
-                  fi
-                  # 检查是否已存在该配置
-                  if ! grep -q "kerneldriver" common/drivers/Makefile; then
-                      echo "添加kerneldriver到Makefile..."
-                      echo "obj-y += kerneldriver/" >> common/drivers/Makefile
-                  fi
-                  echo "Makefile最后几行内容:"
-                  tail -10 common/drivers/Makefile
+      - name: Add module to GKI modules list
+        if: ${{ github.event.inputs.android_version > 13 }}
+        run: |
+          cd android-kernel
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Prepare module list for legacy builds
+        if: ${{ github.event.inputs.android_version <= 13 }}
+        run: |
+          cd android-kernel
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules
+      - name: Increase stack frame size limit
+        run: |
+          cd android-kernel
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
 
-            # 步骤7: 安装构建依赖
-            - name: Install build dependencies
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y \
-                    build-essential \
-                    flex \
-                    bison \
-                    libncurses-dev \
-                    libssl-dev \
-                    libelf-dev \
-                    bc \
-                    rsync \
-                    kmod \
-                    cpio \
-                    python3 \
-                    python3-pip
-
-            # 步骤8: 构建Android内核
-            - name: Build Android Kernel
-              timeout-minutes: 120
-              run: |
-                  cd android-kernel
-                  # 设置环境变量
-                  export LTO=thin
-                  export BUILD_CONFIG=common/build.config.gki.aarch64
-                  export KBUILD_BUILD_USER=github-action
-                  export KBUILD_BUILD_HOST=github
-                  
-                  # 创建必要的目录
-                  mkdir -p out
-                  
-                  echo "开始构建Android内核..."
-                  echo "构建配置: BUILD_CONFIG=$BUILD_CONFIG, LTO=$LTO"
-                  
-                  # 运行构建脚本
-                  if [ -f "build/build.sh" ]; then
-                      echo "找到 build/build.sh，开始构建..."
-                      build/build.sh -j$(nproc)
-                  else
-                      echo "错误: build/build.sh 不存在"
-                      echo "当前目录: $(pwd)"
-                      echo "build目录内容:"
-                      ls -la build/ 2>/dev/null || echo "build目录不存在"
-                      exit 1
-                  fi
-
-            # 步骤9: 上传编译好的驱动文件
-            - name: Upload kerneldriver.ko
-              if: success() || failure()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: kernel-driver-artifacts
-                  path: |
-                      android-kernel/out/**/*.ko
-                      android-kernel/out/android12-5.10/dist/
-                      android-kernel/out/android12-5.10/common/drivers/kerneldriver/
-                  retention-days: 7
-
-            # 步骤10: 检查构建输出
-            - name: Check build output
-              if: always()
-              run: |
-                  echo "构建输出目录内容:"
-                  find android-kernel/out -type f -name "*.ko" 2>/dev/null | head -30 || echo "未找到.ko文件"
-                  echo "=== 重要文件检查 ==="
-                  echo "1. kerneldriver目录:"
-                  ls -la android-kernel/out/android12-5.10/common/drivers/kerneldriver/ 2>/dev/null || echo "kerneldriver目录不存在"
-                  echo "2. dist目录:"
-                  ls -la android-kernel/out/android12-5.10/dist/ 2>/dev/null || echo "dist目录不存在"
-                  echo "3. out根目录:"
-                  ls -la android-kernel/out/ 2>/dev/null || echo "out目录不存在"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+      - name: Fix missing kprobe symbols for Android 13
+        if: ${{ github.event.inputs.android_version == 13 }}
+        run: |
+          cd android-kernel
+          for symbol in register_kprobe unregister_kprobe; do
+            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
+            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
+          done
+          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
+          
+      - name: Build kernel module
+        run: |
+          cd android-kernel
+          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+          else
+            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
+            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
+            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+          fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: |
+            android-kernel/${{ env.OUTPUT_PATH }}
