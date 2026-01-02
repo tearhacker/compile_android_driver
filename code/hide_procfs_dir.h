@@ -63,7 +63,11 @@ static bool start_hide_procfs_dir(const char* hide_dir_name)
 {
 	//这里原理上可以换成SKRoot的汇编写法。避免kprobe。
     int ret;
+#if MY_LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
+    strscpy(g_hide_dir_name, hide_dir_name, sizeof(g_hide_dir_name));
+#else
     strlcpy(g_hide_dir_name, hide_dir_name, sizeof(g_hide_dir_name));
+#endif
     ret = register_kprobe(&kp_hide_procfs_dir);
     if (ret) {
         printk_debug("[hide_procfs_dir] register_kprobe failed: %d\n", ret);

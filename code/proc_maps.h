@@ -6,9 +6,24 @@
 #include <linux/pid.h>
 #include <linux/types.h>
 #include <linux/mm_types.h>
+#include <linux/version.h>
 #if MY_LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,83)
 #include <linux/sched/task.h>
 #include <linux/sched/mm.h>
+#endif
+
+// VMA 遍历兼容宏 - 6.1+ 内核使用 maple tree
+#if MY_LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
+#include <linux/mm.h>
+// 6.1+ 内核：使用 maple tree 迭代器
+// 用法: VMA_FOR_EACH(mm, vma) { ... }
+#define VMA_FOR_EACH(mm, vma) \
+    VMA_ITERATOR(_vma_iter_##__LINE__, mm, 0); \
+    for_each_vma(_vma_iter_##__LINE__, vma)
+#else
+// 旧内核：使用链表遍历
+#define VMA_FOR_EACH(mm, vma) \
+    for (vma = mm->mmap; vma; vma = vma->vm_next)
 #endif
 
 static inline int down_read_mmap_lock(struct mm_struct *mm);

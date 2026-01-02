@@ -39,7 +39,7 @@ static struct task_struct *x_get_current(void) {
 }
 
 static void * x_kmalloc(size_t size, gfp_t flags) {
-	return __kmalloc(size, flags);
+	return kmalloc(size, flags);
 }
 
 static unsigned long x_copy_from_user(void *to, const void __user *from, unsigned long n) {
