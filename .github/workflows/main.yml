@@ -114,20 +114,33 @@ jobs:
           
           echo "=== 编译外部模块 ==="
           
-          # 查找交叉编译工具链
+          # 安装 LLVM 工具链
+          sudo apt-get install -y clang lld llvm
+          
+          # 查找预置的交叉编译工具链
           CLANG_BIN=$(find prebuilts -path "*/linux-x86/clang-*/bin" -type d 2>/dev/null | head -1)
           GCC_BIN=$(find prebuilts -path "*aarch64*linux-android*/bin" -type d 2>/dev/null | head -1)
           
-          if [ -z "$CLANG_BIN" ]; then
-            echo "未找到预置 clang，安装系统工具链"
-            sudo apt-get install -y clang lld llvm
+          # 优先使用预置工具链，否则用系统的
+          if [ -n "$CLANG_BIN" ] && [ -f "$CLANG_BIN/clang" ]; then
+            echo "使用预置 clang: $CLANG_BIN"
+          else
             CLANG_BIN="/usr/bin"
+            echo "使用系统 clang: $CLANG_BIN"
           fi
           
           echo "CLANG_BIN: $CLANG_BIN"
           echo "GCC_BIN: $GCC_BIN"
           
-          export PATH="$CLANG_BIN:$GCC_BIN:$PATH"
+          # 确保 ld.lld 可用
+          which ld.lld || sudo ln -sf /usr/bin/lld /usr/bin/ld.lld
+          
+          export PATH="$CLANG_BIN:$GCC_BIN:/usr/bin:$PATH"
+          
+          # 验证工具链
+          echo "=== 工具链版本 ==="
+          clang --version | head -1
+          ld.lld --version | head -1
           
           # 查找 .config 和 Module.symvers
           KERNEL_OUT=""
