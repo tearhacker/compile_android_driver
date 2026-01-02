@@ -64,26 +64,14 @@ jobs:
         if: ${{ github.event.inputs.android_version > 13 }}
         run: |
           cd android-kernel
-          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
           
-          awk -i inplace -v module="$MODULE_NAME" '
-            BEGIN { added=0 }
-            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
-            in_list && /\]/ {
-              if (!added) {
-                print "    \"" module "\","
-                added=1
-              }
-              in_list=0
-            }
-            in_list && !added {
-              if (module < $0) {
-                print "    \"" module "\","
-                added=1
-              }
-            }
-            { print }
-          ' common/modules.bzl
+          # 对于 Android 14+ 使用 obj-y 内置编译，不需要添加到模块列表
+          # 模块代码会直接编译进内核镜像
+          echo "Android ${{ github.event.inputs.android_version }} 使用 obj-y 内置编译模式"
+          echo "模块将直接编译进内核，无需添加到 GKI 模块列表"
+          
+          # 验证 Makefile 使用 obj-y
+          cat common/drivers/kerneldriver/Makefile
           
       - name: Prepare module list for legacy builds
         if: ${{ github.event.inputs.android_version <= 13 }}
@@ -117,8 +105,10 @@ jobs:
             OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
           else
             echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
-            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+            # 使用 kernel_aarch64_dist 但不检查特定 .ko 文件
+            # 因为我们使用 obj-y 内置编译，模块代码直接编译进内核
+            tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}
+            OUTPUT_PATH="bazel-bin/common/kernel_${{ github.event.inputs.target_arch }}"
           fi
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
       
