@@ -104,70 +104,95 @@ jobs:
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
             OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
           else
-            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            # 使用 kernel_aarch64_dist 但不检查特定 .ko 文件
-            # 因为我们使用 obj-y 内置编译，模块代码直接编译进内核
+            echo "=== Using Bazel build for Android ${{ github.event.inputs.android_version }} ==="
+            # 使用 obj-y 内置编译，不生成 .ko，直接编译进内核镜像
+            # 只构建内核本体，不用 _dist（它会检查 .ko 文件存在性）
             tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}
+            
+            # 手动收集构建产物
             OUTPUT_PATH="bazel-bin/common/kernel_${{ github.event.inputs.target_arch }}"
+            
+            echo "=== 构建产物位置 ==="
+            ls -la $OUTPUT_PATH/ || true
+            find bazel-bin -name "Image*" -o -name "vmlinux" -o -name "*.ko" 2>/dev/null | head -20 || true
           fi
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
       
       - name: Prepare kernel build environment package
         run: |
           cd android-kernel
-          mkdir -p $GITHUB_WORKSPACE/kernel-dev-package
           
-          echo "=== 复制编译产物 ==="
-          cp -r ${{ env.OUTPUT_PATH }}/* $GITHUB_WORKSPACE/kernel-dev-package/
+          echo "=== 清理 .git 目录节省空间 ==="
+          find . -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
           
-          echo "=== 复制内核头文件 ==="
-          mkdir -p $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers
-          cp -r common/include $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers/
-          cp -r common/arch/${{ github.event.inputs.target_arch == 'aarch64' && 'arm64' || github.event.inputs.target_arch }}/include $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers/arch-include || true
+          echo "=== 清理编译中间文件 ==="
+          find . -name "*.o" -delete 2>/dev/null || true
+          find . -name "*.cmd" -delete 2>/dev/null || true
+          find . -name "*.d" -delete 2>/dev/null || true
           
-          echo "=== 复制内核符号表 ==="
-          find . -name "Module.symvers" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
-          find . -name "vmlinux" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
-          find . -name "System.map" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
+          echo "=== 收集编译产物到 common 目录 ==="
+          mkdir -p common/out
+          find bazel-bin -name "Image" -exec cp {} common/out/ \; 2>/dev/null || true
+          find bazel-bin -name "Image.lz4" -exec cp {} common/out/ \; 2>/dev/null || true
+          find bazel-bin -name "vmlinux" -exec cp {} common/out/ \; 2>/dev/null || true
+          find bazel-bin -name "Module.symvers" -exec cp {} common/out/ \; 2>/dev/null || true
+          find bazel-bin -name "System.map" -exec cp {} common/out/ \; 2>/dev/null || true
+          find bazel-bin -name ".config" -exec cp {} common/out/ \; 2>/dev/null || true
           
-          echo "=== 复制内核配置 ==="
-          find . -name ".config" -path "*/out/*" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
+          echo "=== 检查大小 ==="
+          du -sh common/
           
-          echo "=== 清理中间文件 ==="
-          cd $GITHUB_WORKSPACE/kernel-dev-package
-          find . -name "*.o" -delete
-          find . -name "*.cmd" -delete
-          find . -name "*.d" -delete
+          echo "=== 打包完整源码 ==="
+          cd $GITHUB_WORKSPACE/android-kernel
+          ARCHIVE_NAME="kernel-source-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}"
           
-          echo "=== 生成模块编译说明 ==="
-          cat > README_BUILD_MODULE.md << 'EOF'
-          # 内核模块编译环境
+          # 分卷压缩，每卷 1.9GB（Release 限制 2GB）
+          tar -cvf - common | split -b 1900M - "$GITHUB_WORKSPACE/${ARCHIVE_NAME}.tar.part"
           
-          ## 包含内容
-          - `*.ko` - 编译好的内核模块
-          - `Image*` - 内核镜像
-          - `vmlinux` - 未压缩内核 (用于调试)
-          - `Module.symvers` - 内核符号表 (编译外部模块必需)
-          - `System.map` - 内核符号地址映射
-          - `.config` - 内核配置
-          - `kernel-headers/` - 内核头文件
-          
-          ## 本地编译其他模块
-          ```bash
-          export KERNEL_DIR=/path/to/kernel-dev-package
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          make -C $KERNEL_DIR M=$(pwd) modules
-          ```
-          EOF
-          
-          echo "=== 压缩打包 ==="
+          # 如果只有一个分卷，重命名为 .tar.gz
           cd $GITHUB_WORKSPACE
-          tar -czvf kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz kernel-dev-package
-          ls -lh kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz
+          PART_COUNT=$(ls -1 ${ARCHIVE_NAME}.tar.part* 2>/dev/null | wc -l)
+          if [ "$PART_COUNT" -eq 1 ]; then
+            mv ${ARCHIVE_NAME}.tar.partaa ${ARCHIVE_NAME}.tar
+            gzip ${ARCHIVE_NAME}.tar
+            echo "SINGLE_FILE=true" >> $GITHUB_ENV
+          else
+            echo "SINGLE_FILE=false" >> $GITHUB_ENV
+          fi
+          
+          ls -lh ${ARCHIVE_NAME}*
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4.6.2
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
         with:
-          name: kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
-          path: kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz
+          tag_name: kernel-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.run_number }}
+          name: "GKI Kernel ${{ github.event.inputs.target_arch }} Android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}"
+          body: |
+            ## GKI 内核完整源码 + 编译产物
+            
+            - Android 版本: ${{ github.event.inputs.android_version }}
+            - 内核版本: ${{ github.event.inputs.kernel_version }}
+            - 架构: ${{ github.event.inputs.target_arch }}
+            - 驱动已内置编译进 Image
+            
+            ### 下载后解压
+            ```bash
+            # 单文件
+            tar -xzvf kernel-source-*.tar.gz
+            
+            # 分卷文件
+            cat kernel-source-*.tar.part* | tar -xvf -
+            ```
+            
+            ### 编译外部模块
+            ```bash
+            export KDIR=/path/to/common
+            make -C $KDIR M=$(pwd) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
+            ```
+          files: |
+            ${{ env.ARCHIVE_NAME }}*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # artifact 上传已移除，改用 Release 上传完整源码
