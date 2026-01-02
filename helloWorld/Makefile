@@ -1,4 +1,12 @@
-# 对于 GKI 内核，使用 obj-y 将模块编译进内核
-# 如果需要编译为独立模块，改为 obj-m
-obj-y += hello.o
+# 编译为独立内核模块 (.ko)
+obj-m += hello.o
 hello-objs := Hello.o
+
+# 本地编译用 (可选)
+# KDIR ?= /lib/modules/$(shell uname -r)/build
+# 
+# all:
+# 	make -C $(KDIR) M=$(PWD) modules
+# 
+# clean:
+# 	make -C $(KDIR) M=$(PWD) clean

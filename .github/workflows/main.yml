@@ -4,19 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Android Version (Kernel) (e.g., 14)'
+        description: 'Android Version (e.g., 13, 14, 15)'
         required: true
+        default: '14'
       kernel_version:
-        description: 'Kernel Version (e.g., 6.1)'
+        description: 'Kernel Version (e.g., 5.15, 6.1, 6.6)'
         required: true
+        default: '6.1'
       driver_name:
         description: 'Driver Module Name (e.g., hello.ko)'
         required: true
         default: 'hello.ko'
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: 'Target Architecture'
         required: true
         default: 'aarch64'
+
+env:
+  ANDROID_VERSION: ${{ github.event.inputs.android_version }}
+  KERNEL_VERSION: ${{ github.event.inputs.kernel_version }}
+  DRIVER_NAME: ${{ github.event.inputs.driver_name }}
+  TARGET_ARCH: ${{ github.event.inputs.target_arch }}
 
 jobs:
   build:
@@ -24,7 +32,7 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
       - name: Free up disk space
         run: |
@@ -33,141 +41,230 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/hostedtoolcache/node
           sudo docker image prune --all --force || true
           df -h
-        
-      - name: Prepare kerneldriver directory
+
+      - name: Install dependencies
         run: |
-          mkdir kerneldriver
-          cp ./helloWorld/*.c ./helloWorld/Makefile kerneldriver/
-          ls -la kerneldriver/
-          
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc \
+            python-is-python3 git-lfs cpio kmod
+
       - name: Install repo tool
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
 
-      - name: Set up Android Kernel source
+      - name: Sync Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android${ANDROID_VERSION}-${KERNEL_VERSION}
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
-      - name: Copy kerneldriver
+
+      - name: Prepare driver source
+        run: |
+          mkdir -p android-kernel/external_modules/hello
+          cp ./helloWorld/Hello.c android-kernel/external_modules/hello/
+          
+          # 创建独立模块 Makefile (obj-m 编译为 .ko)
+          cat > android-kernel/external_modules/hello/Makefile << 'EOF'
+          obj-m += hello.o
+          hello-objs := Hello.o
+          EOF
+          
+          ls -la android-kernel/external_modules/hello/
+
+      - name: Build Kernel (Android 13 and below - build.sh)
+        if: ${{ github.event.inputs.android_version <= 13 }}
         run: |
           cd android-kernel
-          cp -r ../kerneldriver common/drivers
+          
+          # 添加 kprobe 符号到白名单
+          for symbol in register_kprobe unregister_kprobe; do
+            grep -q "$symbol" common/android/abi_gki_${TARGET_ARCH} || \
+            echo "  $symbol" >> common/android/abi_gki_${TARGET_ARCH}
+          done
+          
+          # 编译内核
+          BUILD_CONFIG=common/build.config.gki.${TARGET_ARCH} \
+            LTO=thin \
+            SKIP_ABI_CHECKS=1 \
+            build/build.sh -j$(nproc)
+          
+          # 设置输出路径
+          echo "KERNEL_OUT=$(pwd)/out/android${ANDROID_VERSION}-${KERNEL_VERSION}/dist" >> $GITHUB_ENV
 
-      - name: Modify Makefile
-        run: |
-          cd android-kernel
-          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
-
-      - name: Add module to GKI modules list
+      - name: Build Kernel (Android 14+ - Bazel)
         if: ${{ github.event.inputs.android_version > 13 }}
         run: |
           cd android-kernel
           
-          # 对于 Android 14+ 使用 obj-y 内置编译，不需要添加到模块列表
-          # 模块代码会直接编译进内核镜像
-          echo "Android ${{ github.event.inputs.android_version }} 使用 obj-y 内置编译模式"
-          echo "模块将直接编译进内核，无需添加到 GKI 模块列表"
+          echo "=== 使用 Bazel 构建 Android ${ANDROID_VERSION} 内核 ==="
           
-          # 验证 Makefile 使用 obj-y
-          cat common/drivers/kerneldriver/Makefile
+          # 构建内核和模块开发所需文件
+          tools/bazel run //common:kernel_${TARGET_ARCH}_dist -- --dist_dir=dist
           
-      - name: Prepare module list for legacy builds
-        if: ${{ github.event.inputs.android_version <= 13 }}
-        run: |
-          cd android-kernel
-          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
-      - name: Increase stack frame size limit
-        run: |
-          cd android-kernel
-          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
-          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
-      - name: Fix missing kprobe symbols for Android 13
-        if: ${{ github.event.inputs.android_version == 13 }}
-        run: |
-          cd android-kernel
-          for symbol in register_kprobe unregister_kprobe; do
-            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
-            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
-          done
-          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
+          echo "=== 构建产物 ==="
+          ls -la dist/ || true
           
-      - name: Build kernel module
+          echo "KERNEL_OUT=$(pwd)/dist" >> $GITHUB_ENV
+
+      - name: Build external module
         run: |
           cd android-kernel
-          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
-            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
-          else
-            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            # 使用 kernel_aarch64_dist 但不检查特定 .ko 文件
-            # 因为我们使用 obj-y 内置编译，模块代码直接编译进内核
-            tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}
-            OUTPUT_PATH="bazel-bin/common/kernel_${{ github.event.inputs.target_arch }}"
+          
+          echo "=== 编译外部模块 ==="
+          
+          # 查找内核构建输出
+          if [ -d "dist" ]; then
+            KDIR="$(pwd)/dist"
+          elif [ -d "out" ]; then
+            KDIR="$(find out -name "dist" -type d | head -1)"
           fi
-          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
-      
-      - name: Prepare kernel build environment package
-        run: |
-          cd android-kernel
-          mkdir -p $GITHUB_WORKSPACE/kernel-dev-package
           
-          echo "=== 复制编译产物 ==="
-          cp -r ${{ env.OUTPUT_PATH }}/* $GITHUB_WORKSPACE/kernel-dev-package/
+          # 查找交叉编译工具链
+          CLANG_PATH="$(find prebuilts -name "clang" -type d | grep -E "linux-x86/clang" | head -1)"
+          if [ -z "$CLANG_PATH" ]; then
+            CLANG_PATH="$(find . -path "*/prebuilts/clang/host/linux-x86/clang-*" -type d | head -1)"
+          fi
           
-          echo "=== 复制内核头文件 ==="
-          mkdir -p $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers
-          cp -r common/include $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers/
-          cp -r common/arch/${{ github.event.inputs.target_arch == 'aarch64' && 'arm64' || github.event.inputs.target_arch }}/include $GITHUB_WORKSPACE/kernel-dev-package/kernel-headers/arch-include || true
+          GCC_PATH="$(find prebuilts -path "*aarch64*/bin" -type d | head -1)"
           
-          echo "=== 复制内核符号表 ==="
-          find . -name "Module.symvers" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
-          find . -name "vmlinux" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
-          find . -name "System.map" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
+          echo "KDIR: $KDIR"
+          echo "CLANG: $CLANG_PATH"
+          echo "GCC: $GCC_PATH"
           
-          echo "=== 复制内核配置 ==="
-          find . -name ".config" -path "*/out/*" -exec cp {} $GITHUB_WORKSPACE/kernel-dev-package/ \; 2>/dev/null || true
-          
-          echo "=== 清理中间文件 ==="
-          cd $GITHUB_WORKSPACE/kernel-dev-package
-          find . -name "*.o" -delete
-          find . -name "*.cmd" -delete
-          find . -name "*.d" -delete
-          
-          echo "=== 生成模块编译说明 ==="
-          cat > README_BUILD_MODULE.md << 'EOF'
-          # 内核模块编译环境
-          
-          ## 包含内容
-          - `*.ko` - 编译好的内核模块
-          - `Image*` - 内核镜像
-          - `vmlinux` - 未压缩内核 (用于调试)
-          - `Module.symvers` - 内核符号表 (编译外部模块必需)
-          - `System.map` - 内核符号地址映射
-          - `.config` - 内核配置
-          - `kernel-headers/` - 内核头文件
-          
-          ## 本地编译其他模块
-          ```bash
-          export KERNEL_DIR=/path/to/kernel-dev-package
+          # 设置环境变量
+          export PATH="$CLANG_PATH/bin:$GCC_PATH:$PATH"
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          make -C $KERNEL_DIR M=$(pwd) modules
-          ```
-          EOF
+          export CC=clang
+          export LLVM=1
           
-          echo "=== 压缩打包 ==="
-          cd $GITHUB_WORKSPACE
-          tar -czvf kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz kernel-dev-package
-          ls -lh kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz
+          # 编译模块
+          cd external_modules/hello
+          make -C "$KDIR" M=$(pwd) \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang \
+            LLVM=1 \
+            modules || {
+              echo "=== 尝试使用内核源码目录编译 ==="
+              cd ../../
+              make -C common M=$(pwd)/external_modules/hello \
+                ARCH=arm64 \
+                CROSS_COMPILE=aarch64-linux-gnu- \
+                CC=clang \
+                LLVM=1 \
+                O="$KDIR" \
+                modules
+            }
+          
+          echo "=== 查找编译产物 ==="
+          find . -name "*.ko" -type f 2>/dev/null
+          
+          # 复制 .ko 到输出目录
+          mkdir -p $GITHUB_WORKSPACE/output
+          find . -name "*.ko" -exec cp {} $GITHUB_WORKSPACE/output/ \;
+          
+          echo "=== 模块信息 ==="
+          for ko in $GITHUB_WORKSPACE/output/*.ko; do
+            if [ -f "$ko" ]; then
+              echo "--- $ko ---"
+              modinfo "$ko" || file "$ko"
+            fi
+          done
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4.6.2
+      - name: Collect build artifacts
+        run: |
+          cd android-kernel
+          
+          echo "=== 收集编译产物 ==="
+          mkdir -p $GITHUB_WORKSPACE/output/kernel
+          
+          # 复制内核镜像
+          for file in Image Image.lz4 Image.gz vmlinux System.map .config Module.symvers; do
+            find . -name "$file" -type f -exec cp {} $GITHUB_WORKSPACE/output/kernel/ \; 2>/dev/null || true
+          done
+          
+          ls -la $GITHUB_WORKSPACE/output/
+          ls -la $GITHUB_WORKSPACE/output/kernel/
+
+      - name: Package kernel source
+        run: |
+          cd android-kernel
+          
+          echo "=== 清理不必要文件 ==="
+          find . -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+          find . -name "*.o" -delete 2>/dev/null || true
+          find . -name "*.cmd" -delete 2>/dev/null || true
+          
+          echo "=== 打包内核源码 ==="
+          ARCHIVE_NAME="kernel-source-android${ANDROID_VERSION}-${KERNEL_VERSION}-${TARGET_ARCH}"
+          
+          # 只打包 common 目录（主要源码）
+          tar -cvf - common | gzip -1 > $GITHUB_WORKSPACE/output/${ARCHIVE_NAME}.tar.gz
+          
+          # 检查大小，如果超过 2GB 则分卷
+          SIZE=$(stat -c%s "$GITHUB_WORKSPACE/output/${ARCHIVE_NAME}.tar.gz")
+          if [ $SIZE -gt 2000000000 ]; then
+            echo "文件过大，进行分卷..."
+            rm $GITHUB_WORKSPACE/output/${ARCHIVE_NAME}.tar.gz
+            tar -cvf - common | split -b 1900M - $GITHUB_WORKSPACE/output/${ARCHIVE_NAME}.tar.part
+          fi
+          
+          ls -lh $GITHUB_WORKSPACE/output/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
-          path: kernel-dev-${{ github.event.inputs.target_arch }}-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}.tar.gz
+          tag_name: v${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}-${{ github.run_number }}
+          name: "GKI Kernel Android${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }} (${{ env.TARGET_ARCH }})"
+          body: |
+            ## GKI 内核编译产物
+            
+            | 项目 | 值 |
+            |------|-----|
+            | Android 版本 | ${{ env.ANDROID_VERSION }} |
+            | 内核版本 | ${{ env.KERNEL_VERSION }} |
+            | 架构 | ${{ env.TARGET_ARCH }} |
+            | 驱动模块 | ${{ env.DRIVER_NAME }} |
+            
+            ### 包含文件
+            - `hello.ko` - 编译好的内核模块
+            - `kernel/` - 内核镜像 (Image, vmlinux, Module.symvers 等)
+            - `kernel-source-*.tar.gz` - 完整内核源码
+            
+            ### 加载模块
+            ```bash
+            # 推送到设备
+            adb push hello.ko /data/local/tmp/
+            
+            # 加载模块 (需要 root)
+            adb shell su -c "insmod /data/local/tmp/hello.ko"
+            
+            # 查看日志
+            adb shell dmesg | grep -i hello
+            
+            # 卸载模块
+            adb shell su -c "rmmod hello"
+            ```
+            
+            ### 使用源码编译其他模块
+            ```bash
+            # 解压源码
+            tar -xzf kernel-source-*.tar.gz
+            
+            # 编译你的模块
+            make -C common M=/path/to/your/module \
+              ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              LLVM=1 \
+              modules
+            ```
+          files: |
+            output/*.ko
+            output/kernel/*
+            output/*.tar.gz
+            output/*.tar.part*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
