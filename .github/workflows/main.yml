@@ -24,6 +24,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
+
+      # 清理磁盘空间 - 解决 "No space left on device" 错误
+      - name: Free up disk space
+        run: |
+          echo "=== 清理前磁盘空间 ==="
+          df -h
+          echo "=== 开始清理 ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/go
+          sudo rm -rf /opt/hostedtoolcache/node
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          echo "=== 清理后磁盘空间 ==="
+          df -h
         
       - name: Prepare kerneldriver directory
         run: |
@@ -34,19 +53,31 @@ jobs:
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
+
       - name: Set up Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
-          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} --depth=1
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync --depth=1
+
+      # repo sync 完成后删除 .repo 目录节省空间
+      - name: Clean up repo metadata
+        run: |
+          cd android-kernel
+          rm -rf .repo
+          echo "=== 删除.repo后磁盘空间 ==="
+          df -h
+
       - name: Copy kerneldriver
         run: |
           cd android-kernel
           cp -r ../kerneldriver common/drivers
+
       - name: Modify Makefile
         run: |
           cd android-kernel
           echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+
       - name: Add module to GKI modules list
         if: ${{ github.event.inputs.android_version > 13 }}
         run: |
@@ -77,15 +108,18 @@ jobs:
         run: |
           cd android-kernel
           echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
+
       - name: Increase stack frame size limit
         run: |
           cd android-kernel
           find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
           grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+
       - name: Fix missing kprobe symbols for Android 13
         if: ${{ github.event.inputs.android_version == 13 }}
         run: |
