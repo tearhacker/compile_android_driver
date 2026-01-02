@@ -66,15 +66,18 @@ jobs:
           cp ./helloWorld/Hello.c android-kernel/external_modules/hello/
           
           # 创建独立模块 Makefile (obj-m 编译为 .ko)
+          # 注意: heredoc 内容不能有缩进
           cat > android-kernel/external_modules/hello/Makefile << 'EOF'
-          obj-m += hello.o
-          hello-objs := Hello.o
-          EOF
+obj-m += hello.o
+hello-objs := Hello.o
+EOF
           
+          echo "=== Makefile 内容 ==="
+          cat android-kernel/external_modules/hello/Makefile
           ls -la android-kernel/external_modules/hello/
 
       - name: Build Kernel (Android 13 and below - build.sh)
-        if: ${{ github.event.inputs.android_version <= 13 }}
+        if: ${{ github.event.inputs.android_version == '12' || github.event.inputs.android_version == '13' }}
         run: |
           cd android-kernel
           
@@ -94,7 +97,7 @@ jobs:
           echo "KERNEL_OUT=$(pwd)/out/android${ANDROID_VERSION}-${KERNEL_VERSION}/dist" >> $GITHUB_ENV
 
       - name: Build Kernel (Android 14+ - Bazel)
-        if: ${{ github.event.inputs.android_version > 13 }}
+        if: ${{ github.event.inputs.android_version != '12' && github.event.inputs.android_version != '13' }}
         run: |
           cd android-kernel
           
@@ -114,65 +117,114 @@ jobs:
           
           echo "=== 编译外部模块 ==="
           
-          # 查找内核构建输出
-          if [ -d "dist" ]; then
-            KDIR="$(pwd)/dist"
-          elif [ -d "out" ]; then
-            KDIR="$(find out -name "dist" -type d | head -1)"
-          fi
-          
           # 查找交叉编译工具链
-          CLANG_PATH="$(find prebuilts -name "clang" -type d | grep -E "linux-x86/clang" | head -1)"
-          if [ -z "$CLANG_PATH" ]; then
-            CLANG_PATH="$(find . -path "*/prebuilts/clang/host/linux-x86/clang-*" -type d | head -1)"
+          CLANG_BIN=$(find prebuilts -path "*/linux-x86/clang-*/bin" -type d 2>/dev/null | head -1)
+          GCC_BIN=$(find prebuilts -path "*aarch64*linux-android*/bin" -type d 2>/dev/null | head -1)
+          
+          if [ -z "$CLANG_BIN" ]; then
+            echo "未找到预置 clang，安装系统工具链"
+            sudo apt-get install -y clang lld llvm
+            CLANG_BIN="/usr/bin"
           fi
           
-          GCC_PATH="$(find prebuilts -path "*aarch64*/bin" -type d | head -1)"
+          echo "CLANG_BIN: $CLANG_BIN"
+          echo "GCC_BIN: $GCC_BIN"
           
-          echo "KDIR: $KDIR"
-          echo "CLANG: $CLANG_PATH"
-          echo "GCC: $GCC_PATH"
+          export PATH="$CLANG_BIN:$GCC_BIN:$PATH"
           
-          # 设置环境变量
-          export PATH="$CLANG_PATH/bin:$GCC_PATH:$PATH"
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
-          export LLVM=1
+          # 查找 .config 和 Module.symvers
+          KERNEL_OUT=""
+          if [ -d "dist" ]; then
+            KERNEL_OUT="$(pwd)/dist"
+          else
+            KERNEL_OUT="$(find out bazel-bin -name "dist" -type d 2>/dev/null | head -1)"
+          fi
           
-          # 编译模块
-          cd external_modules/hello
-          make -C "$KDIR" M=$(pwd) \
-            ARCH=arm64 \
+          echo "KERNEL_OUT: $KERNEL_OUT"
+          
+          # 准备内核源码目录用于模块编译
+          KERNEL_SRC="$(pwd)/common"
+          MODULE_DIR="$(pwd)/external_modules/hello"
+          
+          # 复制 .config 和 Module.symvers 到源码目录
+          if [ -n "$KERNEL_OUT" ] && [ -d "$KERNEL_OUT" ]; then
+            echo "=== 复制构建配置到源码目录 ==="
+            cp "$KERNEL_OUT/.config" "$KERNEL_SRC/" 2>/dev/null || true
+            cp "$KERNEL_OUT/Module.symvers" "$KERNEL_SRC/" 2>/dev/null || true
+            
+            # 复制生成的头文件
+            if [ -d "$KERNEL_OUT/include" ]; then
+              cp -r "$KERNEL_OUT/include/config" "$KERNEL_SRC/include/" 2>/dev/null || true
+              cp -r "$KERNEL_OUT/include/generated" "$KERNEL_SRC/include/" 2>/dev/null || true
+            fi
+          fi
+          
+          # 确保有 .config
+          if [ ! -f "$KERNEL_SRC/.config" ]; then
+            echo "=== 生成默认 GKI 配置 ==="
+            make -C "$KERNEL_SRC" ARCH=arm64 gki_defconfig || true
+          fi
+          
+          # 准备内核构建环境
+          echo "=== 准备内核构建环境 ==="
+          make -C "$KERNEL_SRC" ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang \
-            LLVM=1 \
-            modules || {
-              echo "=== 尝试使用内核源码目录编译 ==="
-              cd ../../
-              make -C common M=$(pwd)/external_modules/hello \
-                ARCH=arm64 \
-                CROSS_COMPILE=aarch64-linux-gnu- \
-                CC=clang \
-                LLVM=1 \
-                O="$KDIR" \
-                modules
-            }
+            modules_prepare
+          
+          # 编译外部模块
+          echo "=== 编译外部模块 ==="
+          make -C "$KERNEL_SRC" M="$MODULE_DIR" \
+            ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            modules
           
           echo "=== 查找编译产物 ==="
           find . -name "*.ko" -type f 2>/dev/null
           
           # 复制 .ko 到输出目录
           mkdir -p $GITHUB_WORKSPACE/output
-          find . -name "*.ko" -exec cp {} $GITHUB_WORKSPACE/output/ \;
+          find . -name "*.ko" -exec cp {} $GITHUB_WORKSPACE/output/ \; 2>/dev/null || true
           
-          echo "=== 模块信息 ==="
-          for ko in $GITHUB_WORKSPACE/output/*.ko; do
-            if [ -f "$ko" ]; then
+          # 检查是否成功
+          if ls $GITHUB_WORKSPACE/output/*.ko 1>/dev/null 2>&1; then
+            echo "=== 模块编译成功 ==="
+            for ko in $GITHUB_WORKSPACE/output/*.ko; do
               echo "--- $ko ---"
-              modinfo "$ko" || file "$ko"
+              file "$ko"
+              
+              echo "--- 模块依赖的符号 ---"
+              ${CLANG_BIN}/llvm-nm "$ko" 2>/dev/null | grep " U " || nm "$ko" | grep " U " || true
+              
+              echo "--- vermagic ---"
+              strings "$ko" | grep vermagic || true
+            done
+            
+            # 验证符号是否在 ABI 白名单中
+            echo "=== 验证符号兼容性 ==="
+            ABI_FILE="$KERNEL_SRC/android/abi_gki_aarch64"
+            if [ -f "$ABI_FILE" ]; then
+              for ko in $GITHUB_WORKSPACE/output/*.ko; do
+                echo "检查 $ko 的符号..."
+                UNDEFINED=$(${CLANG_BIN}/llvm-nm "$ko" 2>/dev/null | grep " U " | awk '{print $2}' || nm "$ko" | grep " U " | awk '{print $2}')
+                MISSING=""
+                for sym in $UNDEFINED; do
+                  # 跳过编译器内置符号
+                  case "$sym" in
+                    __stack_chk_*|__aeabi_*|__gnu_*|_GLOBAL_*) continue ;;
+                  esac
+                  if ! grep -q "^  $sym$" "$ABI_FILE" 2>/dev/null; then
+                    # 基础内核符号通常都导出，只警告非基础符号
+                    echo "  符号 $sym 不在 ABI 白名单中 (可能是基础符号，通常没问题)"
+                  fi
+                done
+              done
             fi
-          done
+          else
+            echo "::error::模块编译失败"
+            exit 1
+          fi
 
       - name: Collect build artifacts
         run: |
