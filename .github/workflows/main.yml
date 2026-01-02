@@ -66,11 +66,8 @@ jobs:
           cp ./helloWorld/Hello.c android-kernel/external_modules/hello/
           
           # 创建独立模块 Makefile (obj-m 编译为 .ko)
-          # 注意: heredoc 内容不能有缩进
-          cat > android-kernel/external_modules/hello/Makefile << 'EOF'
-obj-m += hello.o
-hello-objs := Hello.o
-EOF
+          echo 'obj-m += hello.o' > android-kernel/external_modules/hello/Makefile
+          echo 'hello-objs := Hello.o' >> android-kernel/external_modules/hello/Makefile
           
           echo "=== Makefile 内容 ==="
           cat android-kernel/external_modules/hello/Makefile
